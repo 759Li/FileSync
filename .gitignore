@@ -1,0 +1,8 @@
+node_modules
+dist
+src-tauri/target
+src-tauri/gen/schemas
+*.log
+终端信息.txt
+提示词.md
+compare_backup.py
