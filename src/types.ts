@@ -79,4 +79,34 @@ export interface SyncResult {
   durationMs: number;
   errors: ErrorItem[];
   conflicts: string[];
+  /** 本次同步后累计可撤销的复制文件数 */
+  undoable: number;
+}
+
+/** 后端 undo-progress 事件的数据结构 */
+export interface UndoProgressPayload {
+  removed: number;
+  total: number;
+  currentFile: string;
+  /** 0-100 */
+  percent: number;
+}
+
+/** 后端 undo-result 事件的数据结构 */
+export interface UndoResult {
+  /** 成功删除（撤销）数 */
+  removed: number;
+  /** 目标文件已不存在，无需撤销 */
+  missing: number;
+  /** 目标文件大小与复制时不一致（可能已被修改），保留未删 */
+  modified: number;
+  /** 删除失败数（仍保留在撤销记录中，可重试） */
+  failed: number;
+  cancelled: boolean;
+  /** 顺带清理的空目录数 */
+  removedDirs: number;
+  durationMs: number;
+  /** 撤销后仍可撤销的文件数 */
+  remaining: number;
+  errors: ErrorItem[];
 }

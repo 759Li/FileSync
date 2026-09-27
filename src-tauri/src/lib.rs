@@ -16,6 +16,8 @@ pub fn run() {
             commands::stop_compare,
             commands::apply_sync_action,
             commands::stop_sync,
+            commands::undo_sync,
+            commands::stop_undo,
             commands::export_csv,
             commands::open_in_explorer
         ])

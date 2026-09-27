@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { SyncAction, SyncProgressPayload, SyncResult } from "../types";
+import type { SyncAction, SyncProgressPayload, SyncResult, UndoProgressPayload, UndoResult } from "../types";
 import { formatDuration } from "../lib/format";
 import { Button } from "./ui/button";
 import { Progress } from "./ui/progress";
@@ -13,24 +13,38 @@ interface SyncPanelProps {
   syncing: boolean;
   syncProgress: SyncProgressPayload | null;
   syncResult: SyncResult | null;
+  /** 当前累计可撤销的复制文件数 */
+  undoable: number;
+  undoing: boolean;
+  undoProgress: UndoProgressPayload | null;
+  undoResult: UndoResult | null;
   onAction: (action: SyncAction) => void;
   onIgnore: () => void;
   onStop: () => void;
+  onUndo: () => void;
+  onStopUndo: () => void;
 }
 
-/** 比对完成后的同步操作面板：一键一致化 / 单向复制 / 不做处理 */
+/** 比对完成后的同步操作面板：一键一致化 / 单向复制 / 不做处理 / 撤销同步 */
 export function SyncPanel({
   onlyACount,
   onlyBCount,
   syncing,
   syncProgress,
   syncResult,
+  undoable,
+  undoing,
+  undoProgress,
+  undoResult,
   onAction,
   onIgnore,
   onStop,
+  onUndo,
+  onStopUndo,
 }: SyncPanelProps) {
   const [showErrors, setShowErrors] = useState(false);
   const hasUnique = onlyACount + onlyBCount > 0;
+  const busy = syncing || undoing;
 
   return (
     <section className="space-y-3 rounded-xl border bg-card p-4 shadow-sm">
@@ -65,6 +79,30 @@ export function SyncPanel({
           {syncProgress?.currentFile ? (
             <p className="truncate rounded-md bg-muted px-2 py-1.5 font-mono text-xs text-muted-foreground" title={syncProgress.currentFile}>
               {syncProgress.currentFile}
+            </p>
+          ) : null}
+        </div>
+      )}
+
+      {/* 撤销进行中：进度条 */}
+      {undoing && (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-sm font-medium">正在撤销同步（删除复制产生的文件）…</span>
+            <Button variant="destructive" size="sm" onClick={onStopUndo}>
+              停止撤销
+            </Button>
+          </div>
+          <Progress value={undoProgress?.percent ?? 0} />
+          <div className="flex items-center justify-between text-xs text-muted-foreground">
+            <span>
+              已删除 {undoProgress?.removed ?? 0} / {undoProgress?.total ?? "?"} 个（
+              {undoProgress && undoProgress.total > 0 ? undoProgress.percent.toFixed(1) : "0.0"}%）
+            </span>
+          </div>
+          {undoProgress?.currentFile ? (
+            <p className="truncate rounded-md bg-muted px-2 py-1.5 font-mono text-xs text-muted-foreground" title={undoProgress.currentFile}>
+              {undoProgress.currentFile}
             </p>
           ) : null}
         </div>
@@ -118,18 +156,58 @@ export function SyncPanel({
         </div>
       )}
 
-      {/* 操作按钮（同步中禁用） */}
+      {/* 撤销完成：结果摘要 */}
+      {!undoing && undoResult && (
+        <div
+          className={cn(
+            "rounded-lg border px-3 py-2 text-sm",
+            undoResult.failed > 0
+              ? "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+              : "border-border bg-muted text-foreground"
+          )}
+        >
+          {undoResult.cancelled ? "⏹ " : "✅ "}
+          「撤销同步」{undoResult.cancelled ? "已停止" : "完成"}：删除{" "}
+          <span className="font-semibold">{undoResult.removed.toLocaleString()}</span> 个 · 已不存在{" "}
+          <span className="font-semibold">{undoResult.missing.toLocaleString()}</span> 个 · 已修改保留{" "}
+          <span className="font-semibold">{undoResult.modified.toLocaleString()}</span> 个 · 失败{" "}
+          <span className="font-semibold">{undoResult.failed.toLocaleString()}</span> 个 · 清理空目录{" "}
+          <span className="font-semibold">{undoResult.removedDirs.toLocaleString()}</span> 个 · 耗时{" "}
+          {formatDuration(undoResult.durationMs)}
+          {undoResult.errors.length > 0 && (
+            <div className="mt-1 max-h-24 space-y-0.5 overflow-y-auto">
+              {undoResult.errors.slice(0, 500).map((e, i) => (
+                <p key={i} className="truncate font-mono text-xs text-destructive" title={`${e.path} — ${e.error}`}>
+                  {e.path} — {e.error}
+                </p>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 操作按钮（同步/撤销进行中禁用） */}
       <div className="flex flex-wrap items-center gap-2">
-        <Button size="sm" disabled={syncing || !hasUnique} onClick={() => onAction("unify")} title="将 A 独有复制到 B，同时将 B 独有复制到 A">
+        <Button size="sm" disabled={busy || !hasUnique} onClick={() => onAction("unify")} title="将 A 独有复制到 B，同时将 B 独有复制到 A">
           🔁 一键一致化（共 {(onlyACount + onlyBCount).toLocaleString()} 个）
         </Button>
-        <Button size="sm" variant="outline" disabled={syncing || onlyACount === 0} onClick={() => onAction("aToB")}>
+        <Button size="sm" variant="outline" disabled={busy || onlyACount === 0} onClick={() => onAction("aToB")}>
           A 独有 → B（{onlyACount.toLocaleString()} 个）
         </Button>
-        <Button size="sm" variant="outline" disabled={syncing || onlyBCount === 0} onClick={() => onAction("bToA")}>
+        <Button size="sm" variant="outline" disabled={busy || onlyBCount === 0} onClick={() => onAction("bToA")}>
           B 独有 → A（{onlyBCount.toLocaleString()} 个）
         </Button>
-        <Button size="sm" variant="ghost" disabled={syncing} onClick={onIgnore}>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy || undoable === 0}
+          onClick={onUndo}
+          title="删除本次比对会话内、历次同步复制到对侧的文件（大小被修改过的会保留）"
+          className={cn(undoable > 0 && !busy && "border-amber-500/50 text-amber-600 hover:text-amber-600 dark:text-amber-400")}
+        >
+          ↩ 撤销同步{undoable > 0 ? `（${undoable.toLocaleString()} 个）` : ""}
+        </Button>
+        <Button size="sm" variant="ghost" disabled={busy} onClick={onIgnore}>
           不做处理
         </Button>
       </div>

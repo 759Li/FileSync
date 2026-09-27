@@ -30,13 +30,14 @@ pub fn start_compare(
     if state.inner.running.swap(true, Ordering::SeqCst) {
         return Err("已有比对任务正在进行".into());
     }
-    if state.inner.syncing.load(Ordering::SeqCst) {
+    if state.inner.syncing.load(Ordering::SeqCst) || state.inner.undoing.load(Ordering::SeqCst) {
         state.inner.running.store(false, Ordering::SeqCst);
-        return Err("同步任务正在进行，请等待完成或停止后再比对".into());
+        return Err("同步/撤销任务正在进行，请等待完成或停止后再比对".into());
     }
     state.inner.cancel.store(false, Ordering::SeqCst);
-    // 记录根目录，供比对后的同步操作还原相对路径
+    // 记录根目录，供比对后的同步操作还原相对路径；清空上一会话的撤销记录
     *state.inner.last_roots.lock().unwrap() = Some((dir_a.clone(), dir_b.clone()));
+    state.inner.last_sync.lock().unwrap().clear();
 
     let inner = state.inner.clone();
     std::thread::spawn(move || {
@@ -69,6 +70,9 @@ pub fn apply_sync_action(
 
     if state.inner.running.load(Ordering::SeqCst) {
         return Err("比对任务正在进行，请等待完成或停止后再同步".into());
+    }
+    if state.inner.undoing.load(Ordering::SeqCst) {
+        return Err("撤销任务正在进行，请等待完成或停止后再同步".into());
     }
     if state.inner.syncing.swap(true, Ordering::SeqCst) {
         return Err("已有同步任务正在进行".into());
@@ -108,6 +112,45 @@ pub fn apply_sync_action(
 pub fn stop_sync(state: State<'_, CompareState>) -> bool {
     state.inner.cancel.store(true, Ordering::SeqCst);
     state.inner.syncing.load(Ordering::SeqCst)
+}
+
+/// 撤销本次比对会话内的同步操作：删除复制产生的目标文件（后台线程执行）
+///
+/// 安全规则：目标文件已不存在视为已撤销；大小与复制时不一致视为已被修改、保留不删；
+/// 删除失败或中途停止的条目保留在记录中，可再次执行撤销继续。
+#[tauri::command]
+pub fn undo_sync(app: AppHandle, state: State<'_, CompareState>) -> Result<(), String> {
+    if state.inner.running.load(Ordering::SeqCst) {
+        return Err("比对任务正在进行，请等待完成或停止后再撤销".into());
+    }
+    if state.inner.syncing.load(Ordering::SeqCst) {
+        return Err("同步任务正在进行，请等待完成或停止后再撤销".into());
+    }
+    if state.inner.undoing.swap(true, Ordering::SeqCst) {
+        return Err("已有撤销任务正在进行".into());
+    }
+
+    let items = state.inner.last_sync.lock().unwrap().clone();
+    if items.is_empty() {
+        state.inner.undoing.store(false, Ordering::SeqCst);
+        return Err("当前没有可撤销的同步操作".into());
+    }
+
+    let inner = state.inner.clone();
+    state.inner.cancel.store(false, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let undo_result = crate::sync::run_undo(&app, &inner, items);
+        inner.undoing.store(false, Ordering::SeqCst);
+        let _ = app.emit("undo-result", &undo_result);
+    });
+    Ok(())
+}
+
+/// 终止正在运行的撤销任务（未完成的条目保留在记录中，可继续撤销）
+#[tauri::command]
+pub fn stop_undo(state: State<'_, CompareState>) -> bool {
+    state.inner.cancel.store(true, Ordering::SeqCst);
+    state.inner.undoing.load(Ordering::SeqCst)
 }
 
 /// 导出最近一次比对结果为 CSV（后端缓存的完整结果，UTF-8 BOM，Excel 打开不乱码）

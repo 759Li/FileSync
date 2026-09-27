@@ -7,7 +7,15 @@ import { FolderPicker } from "./components/FolderPicker";
 import { ProgressPanel } from "./components/ProgressPanel";
 import { ResultsView } from "./components/ResultsView";
 import { SyncPanel } from "./components/SyncPanel";
-import type { CompareResult, ProgressPayload, SyncAction, SyncProgressPayload, SyncResult } from "./types";
+import type {
+  CompareResult,
+  ProgressPayload,
+  SyncAction,
+  SyncProgressPayload,
+  SyncResult,
+  UndoProgressPayload,
+  UndoResult,
+} from "./types";
 import { formatDuration } from "./lib/format";
 
 export default function App(): ReactNode {
@@ -22,8 +30,13 @@ export default function App(): ReactNode {
   const [syncProgress, setSyncProgress] = useState<SyncProgressPayload | null>(null);
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
   const [syncPanelOpen, setSyncPanelOpen] = useState(false);
+  const [undoing, setUndoing] = useState(false);
+  const [undoProgress, setUndoProgress] = useState<UndoProgressPayload | null>(null);
+  const [undoResult, setUndoResult] = useState<UndoResult | null>(null);
+  /** 当前累计可撤销的复制文件数（来自最近 sync-result / undo-result） */
+  const [undoable, setUndoable] = useState(0);
 
-  /* 订阅后端事件：进度 + 最终结果 + 同步进度/结果 */
+  /* 订阅后端事件：进度 + 最终结果 + 同步/撤销进度与结果 */
   useEffect(() => {
     const u1 = listen<ProgressPayload>("compare-progress", (e) => setProgress(e.payload));
     const u2 = listen<CompareResult>("compare-result", (e) => {
@@ -32,6 +45,9 @@ export default function App(): ReactNode {
       setProgress(null);
       setSyncResult(null);
       setSyncProgress(null);
+      setUndoResult(null);
+      setUndoProgress(null);
+      setUndoable(0);
       // 比对完整完成且存在单侧独有文件时，展示同步操作面板
       setSyncPanelOpen(!e.payload.stats.cancelled && e.payload.onlyA.length + e.payload.onlyB.length > 0);
     });
@@ -40,12 +56,22 @@ export default function App(): ReactNode {
       setSyncResult(e.payload);
       setSyncing(false);
       setSyncProgress(null);
+      setUndoable(e.payload.undoable);
+    });
+    const u5 = listen<UndoProgressPayload>("undo-progress", (e) => setUndoProgress(e.payload));
+    const u6 = listen<UndoResult>("undo-result", (e) => {
+      setUndoResult(e.payload);
+      setUndoing(false);
+      setUndoProgress(null);
+      setUndoable(e.payload.remaining);
     });
     return () => {
       u1.then((f: UnlistenFn) => f());
       u2.then((f: UnlistenFn) => f());
       u3.then((f: UnlistenFn) => f());
       u4.then((f: UnlistenFn) => f());
+      u5.then((f: UnlistenFn) => f());
+      u6.then((f: UnlistenFn) => f());
     };
   }, []);
 
@@ -60,6 +86,8 @@ export default function App(): ReactNode {
     setProgress(null);
     setSyncResult(null);
     setSyncPanelOpen(false);
+    setUndoResult(null);
+    setUndoable(0);
     try {
       await invoke("start_compare", { pathA, pathB });
       setRunning(true);
@@ -79,6 +107,7 @@ export default function App(): ReactNode {
       setSyncing(true);
       setSyncResult(null);
       setSyncProgress(null);
+      setUndoResult(null);
     } catch (e) {
       notify(String(e), "error");
     }
@@ -91,6 +120,22 @@ export default function App(): ReactNode {
 
   const handleStopSync = () => {
     invoke("stop_sync").catch((e) => notify(String(e), "error"));
+  };
+
+  const handleUndo = async () => {
+    setMessage(null);
+    try {
+      await invoke("undo_sync");
+      setUndoing(true);
+      setUndoResult(null);
+      setUndoProgress(null);
+    } catch (e) {
+      notify(String(e), "error");
+    }
+  };
+
+  const handleStopUndo = () => {
+    invoke("stop_undo").catch((e) => notify(String(e), "error"));
   };
 
   const handleExport = async () => {
@@ -127,7 +172,7 @@ export default function App(): ReactNode {
         <FolderPicker label="文件夹A" value={pathA} onChange={setPathA} />
         <FolderPicker label="文件夹B" value={pathB} onChange={setPathB} />
         <div className="flex flex-wrap items-center gap-2 pt-1">
-          <Button onClick={handleStart} disabled={running || syncing || !pathA || !pathB}>
+          <Button onClick={handleStart} disabled={running || syncing || undoing || !pathA || !pathB}>
             {running ? "比对中…" : "开始比对"}
           </Button>
           <Button variant="destructive" onClick={handleStop} disabled={!running}>
@@ -189,9 +234,15 @@ export default function App(): ReactNode {
               syncing={syncing}
               syncProgress={syncProgress}
               syncResult={syncResult}
+              undoable={undoable}
+              undoing={undoing}
+              undoProgress={undoProgress}
+              undoResult={undoResult}
               onAction={handleSyncAction}
               onIgnore={handleIgnoreSync}
               onStop={handleStopSync}
+              onUndo={handleUndo}
+              onStopUndo={handleStopUndo}
             />
           )}
           <ResultsView result={result} />
