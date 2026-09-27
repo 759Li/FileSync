@@ -6,7 +6,8 @@ import { Button } from "./components/ui/button";
 import { FolderPicker } from "./components/FolderPicker";
 import { ProgressPanel } from "./components/ProgressPanel";
 import { ResultsView } from "./components/ResultsView";
-import type { CompareResult, ProgressPayload } from "./types";
+import { SyncPanel } from "./components/SyncPanel";
+import type { CompareResult, ProgressPayload, SyncAction, SyncProgressPayload, SyncResult } from "./types";
 import { formatDuration } from "./lib/format";
 
 export default function App(): ReactNode {
@@ -17,18 +18,34 @@ export default function App(): ReactNode {
   const [result, setResult] = useState<CompareResult | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [messageType, setMessageType] = useState<"info" | "error">("info");
+  const [syncing, setSyncing] = useState(false);
+  const [syncProgress, setSyncProgress] = useState<SyncProgressPayload | null>(null);
+  const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
+  const [syncPanelOpen, setSyncPanelOpen] = useState(false);
 
-  /* 订阅后端事件：进度 + 最终结果 */
+  /* 订阅后端事件：进度 + 最终结果 + 同步进度/结果 */
   useEffect(() => {
     const u1 = listen<ProgressPayload>("compare-progress", (e) => setProgress(e.payload));
     const u2 = listen<CompareResult>("compare-result", (e) => {
       setResult(e.payload);
       setRunning(false);
       setProgress(null);
+      setSyncResult(null);
+      setSyncProgress(null);
+      // 比对完整完成且存在单侧独有文件时，展示同步操作面板
+      setSyncPanelOpen(!e.payload.stats.cancelled && e.payload.onlyA.length + e.payload.onlyB.length > 0);
+    });
+    const u3 = listen<SyncProgressPayload>("sync-progress", (e) => setSyncProgress(e.payload));
+    const u4 = listen<SyncResult>("sync-result", (e) => {
+      setSyncResult(e.payload);
+      setSyncing(false);
+      setSyncProgress(null);
     });
     return () => {
       u1.then((f: UnlistenFn) => f());
       u2.then((f: UnlistenFn) => f());
+      u3.then((f: UnlistenFn) => f());
+      u4.then((f: UnlistenFn) => f());
     };
   }, []);
 
@@ -41,6 +58,8 @@ export default function App(): ReactNode {
     setMessage(null);
     setResult(null);
     setProgress(null);
+    setSyncResult(null);
+    setSyncPanelOpen(false);
     try {
       await invoke("start_compare", { pathA, pathB });
       setRunning(true);
@@ -51,6 +70,27 @@ export default function App(): ReactNode {
 
   const handleStop = () => {
     invoke("stop_compare").catch((e) => notify(String(e), "error"));
+  };
+
+  const handleSyncAction = async (action: SyncAction) => {
+    setMessage(null);
+    try {
+      await invoke("apply_sync_action", { action });
+      setSyncing(true);
+      setSyncResult(null);
+      setSyncProgress(null);
+    } catch (e) {
+      notify(String(e), "error");
+    }
+  };
+
+  const handleIgnoreSync = () => {
+    setSyncPanelOpen(false);
+    notify("已选择不做处理，可点击统计栏中的「同步操作」重新打开");
+  };
+
+  const handleStopSync = () => {
+    invoke("stop_sync").catch((e) => notify(String(e), "error"));
   };
 
   const handleExport = async () => {
@@ -69,6 +109,7 @@ export default function App(): ReactNode {
   };
 
   const s = result?.stats;
+  const hasUnique = !!result && result.onlyA.length + result.onlyB.length > 0;
 
   return (
     <div className="mx-auto min-h-screen w-full max-w-5xl space-y-4 p-6">
@@ -86,7 +127,7 @@ export default function App(): ReactNode {
         <FolderPicker label="文件夹A" value={pathA} onChange={setPathA} />
         <FolderPicker label="文件夹B" value={pathB} onChange={setPathB} />
         <div className="flex flex-wrap items-center gap-2 pt-1">
-          <Button onClick={handleStart} disabled={running || !pathA || !pathB}>
+          <Button onClick={handleStart} disabled={running || syncing || !pathA || !pathB}>
             {running ? "比对中…" : "开始比对"}
           </Button>
           <Button variant="destructive" onClick={handleStop} disabled={!running}>
@@ -117,7 +158,7 @@ export default function App(): ReactNode {
       {/* 进度区 */}
       <ProgressPanel progress={progress} running={running} onStop={handleStop} />
 
-      {/* 取消提示 + 统计 */}
+      {/* 取消提示 + 统计 + 同步操作 */}
       {result && (
         <section className="space-y-3">
           {result.stats.cancelled && (
@@ -132,8 +173,27 @@ export default function App(): ReactNode {
             <Stat label="大小跳过" value={s!.skippedBySize} />
             <Stat label="读取失败" value={s!.errorCount} />
             {s!.cancelledCount > 0 && <Stat label="未处理(取消)" value={s!.cancelledCount} />}
-            <span className="ml-auto">耗时 {formatDuration(s!.durationMs)}</span>
+            <span className="ml-auto flex items-center gap-3">
+              {!syncPanelOpen && hasUnique && !s!.cancelled && (
+                <Button variant="outline" size="sm" className="h-6 px-2 text-xs" onClick={() => setSyncPanelOpen(true)}>
+                  同步操作
+                </Button>
+              )}
+              耗时 {formatDuration(s!.durationMs)}
+            </span>
           </div>
+          {syncPanelOpen && !s!.cancelled && (
+            <SyncPanel
+              onlyACount={result.onlyA.length}
+              onlyBCount={result.onlyB.length}
+              syncing={syncing}
+              syncProgress={syncProgress}
+              syncResult={syncResult}
+              onAction={handleSyncAction}
+              onIgnore={handleIgnoreSync}
+              onStop={handleStopSync}
+            />
+          )}
           <ResultsView result={result} />
         </section>
       )}

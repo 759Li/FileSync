@@ -1,8 +1,9 @@
-//! Tauri 命令：启动/停止比对、导出 CSV、打开文件所在位置
+//! Tauri 命令：启动/停止比对、同步操作、导出 CSV、打开文件所在位置
 
 use crate::compare::{classify, CompareResult, ErrorItem};
 use crate::scanner::{enumerate_folder, hash_entries, ProgressShared};
 use crate::state::{CompareState, Inner};
+use crate::sync::{run_sync, SyncAction};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -29,7 +30,13 @@ pub fn start_compare(
     if state.inner.running.swap(true, Ordering::SeqCst) {
         return Err("已有比对任务正在进行".into());
     }
+    if state.inner.syncing.load(Ordering::SeqCst) {
+        state.inner.running.store(false, Ordering::SeqCst);
+        return Err("同步任务正在进行，请等待完成或停止后再比对".into());
+    }
     state.inner.cancel.store(false, Ordering::SeqCst);
+    // 记录根目录，供比对后的同步操作还原相对路径
+    *state.inner.last_roots.lock().unwrap() = Some((dir_a.clone(), dir_b.clone()));
 
     let inner = state.inner.clone();
     std::thread::spawn(move || {
@@ -46,6 +53,61 @@ pub fn start_compare(
 pub fn stop_compare(state: State<'_, CompareState>) -> bool {
     state.inner.cancel.store(true, Ordering::SeqCst);
     state.inner.running.load(Ordering::SeqCst)
+}
+
+/// 执行同步动作（基于最近一次完整比对结果，后台线程复制文件）
+///
+/// action: "unify" 一键一致化 | "aToB" A独有→B | "bToA" B独有→A
+#[tauri::command]
+pub fn apply_sync_action(
+    app: AppHandle,
+    state: State<'_, CompareState>,
+    action: String,
+) -> Result<(), String> {
+    let action = SyncAction::parse(&action)
+        .ok_or_else(|| format!("未知的同步动作: {action}（可选 unify / aToB / bToA）"))?;
+
+    if state.inner.running.load(Ordering::SeqCst) {
+        return Err("比对任务正在进行，请等待完成或停止后再同步".into());
+    }
+    if state.inner.syncing.swap(true, Ordering::SeqCst) {
+        return Err("已有同步任务正在进行".into());
+    }
+
+    let result = state.inner.last_result.lock().unwrap().clone();
+    let roots = state.inner.last_roots.lock().unwrap().clone();
+    let inner = state.inner.clone();
+
+    let (result, (dir_a, dir_b)) = match (result, roots) {
+        (Some(r), Some(p)) => (r, p),
+        _ => {
+            state.inner.syncing.store(false, Ordering::SeqCst);
+            return Err("当前没有比对结果，请先执行比对".into());
+        }
+    };
+    if result.stats.cancelled {
+        state.inner.syncing.store(false, Ordering::SeqCst);
+        return Err("上次比对被中断、结果不完整，请重新完成比对后再同步".into());
+    }
+    if !dir_a.is_dir() || !dir_b.is_dir() {
+        state.inner.syncing.store(false, Ordering::SeqCst);
+        return Err("比对时的某个文件夹已不存在，无法执行同步".into());
+    }
+
+    state.inner.cancel.store(false, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let sync_result = run_sync(&app, &inner, action, &result, &dir_a, &dir_b);
+        inner.syncing.store(false, Ordering::SeqCst);
+        let _ = app.emit("sync-result", &sync_result);
+    });
+    Ok(())
+}
+
+/// 终止正在运行的同步任务
+#[tauri::command]
+pub fn stop_sync(state: State<'_, CompareState>) -> bool {
+    state.inner.cancel.store(true, Ordering::SeqCst);
+    state.inner.syncing.load(Ordering::SeqCst)
 }
 
 /// 导出最近一次比对结果为 CSV（后端缓存的完整结果，UTF-8 BOM，Excel 打开不乱码）

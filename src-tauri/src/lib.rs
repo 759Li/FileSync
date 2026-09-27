@@ -5,6 +5,7 @@ mod compare;
 mod csv_export;
 mod scanner;
 mod state;
+mod sync;
 
 pub fn run() {
     tauri::Builder::default()
@@ -13,6 +14,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::start_compare,
             commands::stop_compare,
+            commands::apply_sync_action,
+            commands::stop_sync,
             commands::export_csv,
             commands::open_in_explorer
         ])

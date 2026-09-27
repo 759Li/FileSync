@@ -54,3 +54,29 @@ export interface ProgressPayload {
   /** 0-100，-1 表示未知（枚举阶段） */
   percent: number;
 }
+
+/** 同步动作：unify 一键一致化 | aToB A独有→B | bToA B独有→A */
+export type SyncAction = "unify" | "aToB" | "bToA";
+
+/** 后端 sync-progress 事件的数据结构 */
+export interface SyncProgressPayload {
+  copied: number;
+  total: number;
+  currentFile: string;
+  /** 0-100 */
+  percent: number;
+}
+
+/** 后端 sync-result 事件的数据结构 */
+export interface SyncResult {
+  action: SyncAction;
+  actionLabel: string;
+  copied: number;
+  /** 冲突跳过数（目标侧已存在同名文件） */
+  skipped: number;
+  failed: number;
+  cancelled: boolean;
+  durationMs: number;
+  errors: ErrorItem[];
+  conflicts: string[];
+}
