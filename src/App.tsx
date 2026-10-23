@@ -7,6 +7,7 @@ import { FolderPicker } from "./components/FolderPicker";
 import { ProgressPanel } from "./components/ProgressPanel";
 import { ResultsView } from "./components/ResultsView";
 import { SyncPanel } from "./components/SyncPanel";
+import { DupScanView } from "./components/DupScanView";
 import type {
   CompareResult,
   ProgressPayload,
@@ -17,8 +18,13 @@ import type {
   UndoResult,
 } from "./types";
 import { formatDuration } from "./lib/format";
+import { cn } from "./lib/utils";
+
+/** 顶部功能模式：文件夹比对 / 重复文件扫描 */
+type Mode = "compare" | "dup";
 
 export default function App(): ReactNode {
+  const [mode, setMode] = useState<Mode>("compare");
   const [pathA, setPathA] = useState("");
   const [pathB, setPathB] = useState("");
   const [running, setRunning] = useState(false);
@@ -35,6 +41,8 @@ export default function App(): ReactNode {
   const [undoResult, setUndoResult] = useState<UndoResult | null>(null);
   /** 当前累计可撤销的复制文件数（来自最近 sync-result / undo-result） */
   const [undoable, setUndoable] = useState(0);
+  /** 重复文件扫描是否正在运行（仅用于任务期间禁用模式切换） */
+  const [dupRunning, setDupRunning] = useState(false);
 
   /* 订阅后端事件：进度 + 最终结果 + 同步/撤销进度与结果 */
   useEffect(() => {
@@ -65,6 +73,9 @@ export default function App(): ReactNode {
       setUndoProgress(null);
       setUndoable(e.payload.remaining);
     });
+    // 重复扫描事件：仅跟踪运行标志，用于任务期间禁用模式切换
+    const u7 = listen("dup-scan-progress", () => setDupRunning(true));
+    const u8 = listen("dup-scan-result", () => setDupRunning(false));
     return () => {
       u1.then((f: UnlistenFn) => f());
       u2.then((f: UnlistenFn) => f());
@@ -72,6 +83,8 @@ export default function App(): ReactNode {
       u4.then((f: UnlistenFn) => f());
       u5.then((f: UnlistenFn) => f());
       u6.then((f: UnlistenFn) => f());
+      u7.then((f: UnlistenFn) => f());
+      u8.then((f: UnlistenFn) => f());
     };
   }, []);
 
@@ -161,100 +174,145 @@ export default function App(): ReactNode {
       {/* 标题栏 */}
       <header className="flex items-center justify-between">
         <div>
-          <h1 className="text-xl font-bold tracking-tight">FileSync · 文件夹内容比对</h1>
-          <p className="text-xs text-muted-foreground">基于 SHA256 的备份文件夹对比 · 文件名无关 · 多线程哈希</p>
+          <h1 className="text-xl font-bold tracking-tight">
+            FileSync · {mode === "compare" ? "文件夹内容比对" : "重复文件扫描"}
+          </h1>
+          <p className="text-xs text-muted-foreground">
+            {mode === "compare"
+              ? "基于 SHA256 的备份文件夹对比 · 文件名无关 · 多线程哈希"
+              : "单文件夹重复文件查找 · 大小预筛 + SHA256 内容确认 · 多线程哈希"}
+          </p>
         </div>
         <ThemeToggle />
       </header>
 
-      {/* 输入区 */}
-      <section className="space-y-3 rounded-xl border bg-card p-4 shadow-sm">
-        <FolderPicker label="文件夹A" value={pathA} onChange={setPathA} />
-        <FolderPicker label="文件夹B" value={pathB} onChange={setPathB} />
-        <div className="flex flex-wrap items-center gap-2 pt-1">
-          <Button onClick={handleStart} disabled={running || syncing || undoing || !pathA || !pathB}>
-            {running ? "比对中…" : "开始比对"}
-          </Button>
-          <Button variant="destructive" onClick={handleStop} disabled={!running}>
-            停止扫描
-          </Button>
-          <Button variant="outline" onClick={handleExport} disabled={running || !result}>
-            导出结果 CSV
-          </Button>
-          <span className="ml-auto text-xs text-muted-foreground">
-            大小不同的文件自动跳过哈希，双击结果行可打开所在文件夹
-          </span>
-        </div>
-      </section>
-
-      {/* 消息条 */}
-      {message && (
-        <div
-          className={`rounded-lg border px-3 py-2 text-sm ${
-            messageType === "error"
-              ? "border-destructive/40 bg-destructive/10 text-destructive"
-              : "border-border bg-muted text-foreground"
-          }`}
+      {/* 功能模式切换 */}
+      <div className="flex gap-1 rounded-lg bg-muted p-1">
+        <button
+          onClick={() => setMode("compare")}
+          disabled={running || dupRunning}
+          className={cn(
+            "flex flex-1 items-center justify-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+            mode === "compare" ? "bg-background shadow text-foreground" : "text-muted-foreground hover:text-foreground"
+          )}
         >
-          {message}
-        </div>
-      )}
+          📁 文件夹比对
+        </button>
+        <button
+          onClick={() => setMode("dup")}
+          disabled={running || dupRunning}
+          className={cn(
+            "flex flex-1 items-center justify-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+            mode === "dup" ? "bg-background shadow text-foreground" : "text-muted-foreground hover:text-foreground"
+          )}
+        >
+          🔍 重复文件扫描
+        </button>
+      </div>
 
-      {/* 进度区 */}
-      <ProgressPanel progress={progress} running={running} onStop={handleStop} />
+      {/* 重复扫描视图：始终保持挂载（隐藏而非卸载），
+          避免删除 / 撤销 / 清空等任务进行中切换模式时丢失事件与扫描结果 */}
+      <div className={mode === "dup" ? undefined : "hidden"}>
+        <DupScanView />
+      </div>
 
-      {/* 取消提示 + 统计 + 同步操作 */}
-      {result && (
-        <section className="space-y-3">
-          {result.stats.cancelled && (
-            <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:text-amber-400">
-              扫描已被用户中断，以下为已完成部分的结果。
+      {mode !== "dup" && (
+        <>
+          {/* 输入区 */}
+          <section className="space-y-3 rounded-xl border bg-card p-4 shadow-sm">
+            <FolderPicker label="文件夹A" value={pathA} onChange={setPathA} />
+            <FolderPicker label="文件夹B" value={pathB} onChange={setPathB} />
+            <div className="flex flex-wrap items-center gap-2 pt-1">
+              <Button onClick={handleStart} disabled={running || syncing || undoing || !pathA || !pathB}>
+                {running ? "比对中…" : "开始比对"}
+              </Button>
+              <Button variant="destructive" onClick={handleStop} disabled={!running}>
+                停止扫描
+              </Button>
+              <Button variant="outline" onClick={handleExport} disabled={running || !result}>
+                导出结果 CSV
+              </Button>
+              <span className="ml-auto text-xs text-muted-foreground">
+                大小不同的文件自动跳过哈希，双击结果行可打开所在文件夹
+              </span>
+            </div>
+          </section>
+
+          {/* 消息条 */}
+          {message && (
+            <div
+              className={`rounded-lg border px-3 py-2 text-sm ${
+                messageType === "error"
+                  ? "border-destructive/40 bg-destructive/10 text-destructive"
+                  : "border-border bg-muted text-foreground"
+              }`}
+            >
+              {message}
             </div>
           )}
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border bg-card px-4 py-2 text-xs text-muted-foreground shadow-sm">
-            <Stat label="A 文件" value={s!.totalA} />
-            <Stat label="B 文件" value={s!.totalB} />
-            <Stat label="计算哈希" value={s!.hashed} />
-            <Stat label="大小跳过" value={s!.skippedBySize} />
-            <Stat label="读取失败" value={s!.errorCount} />
-            {s!.cancelledCount > 0 && <Stat label="未处理(取消)" value={s!.cancelledCount} />}
-            <span className="ml-auto flex items-center gap-3">
-              {!syncPanelOpen && hasUnique && !s!.cancelled && (
-                <Button variant="outline" size="sm" className="h-6 px-2 text-xs" onClick={() => setSyncPanelOpen(true)}>
-                  同步操作
-                </Button>
-              )}
-              耗时 {formatDuration(s!.durationMs)}
-            </span>
-          </div>
-          {syncPanelOpen && !s!.cancelled && (
-            <SyncPanel
-              onlyACount={result.onlyA.length}
-              onlyBCount={result.onlyB.length}
-              syncing={syncing}
-              syncProgress={syncProgress}
-              syncResult={syncResult}
-              undoable={undoable}
-              undoing={undoing}
-              undoProgress={undoProgress}
-              undoResult={undoResult}
-              onAction={handleSyncAction}
-              onIgnore={handleIgnoreSync}
-              onStop={handleStopSync}
-              onUndo={handleUndo}
-              onStopUndo={handleStopUndo}
-            />
-          )}
-          <ResultsView result={result} />
-        </section>
-      )}
 
-      {/* 空状态 */}
-      {!result && !running && (
-        <div className="flex h-52 flex-col items-center justify-center gap-2 rounded-xl border border-dashed text-muted-foreground">
-          <span className="text-4xl">🗂️</span>
-          <p className="text-sm">选择两个文件夹后点击「开始比对」</p>
-        </div>
+          {/* 进度区 */}
+          <ProgressPanel
+            progress={progress}
+            running={running}
+            onStop={handleStop}
+            title={progress?.side === "B" ? "文件夹 B" : "文件夹 A"}
+          />
+
+          {/* 取消提示 + 统计 + 同步操作 */}
+          {result && (
+            <section className="space-y-3">
+              {result.stats.cancelled && (
+                <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:text-amber-400">
+                  扫描已被用户中断，以下为已完成部分的结果。
+                </div>
+              )}
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border bg-card px-4 py-2 text-xs text-muted-foreground shadow-sm">
+                <Stat label="A 文件" value={s!.totalA} />
+                <Stat label="B 文件" value={s!.totalB} />
+                <Stat label="计算哈希" value={s!.hashed} />
+                <Stat label="大小跳过" value={s!.skippedBySize} />
+                <Stat label="读取失败" value={s!.errorCount} />
+                {s!.cancelledCount > 0 && <Stat label="未处理(取消)" value={s!.cancelledCount} />}
+                <span className="ml-auto flex items-center gap-3">
+                  {!syncPanelOpen && hasUnique && !s!.cancelled && (
+                    <Button variant="outline" size="sm" className="h-6 px-2 text-xs" onClick={() => setSyncPanelOpen(true)}>
+                      同步操作
+                    </Button>
+                  )}
+                  耗时 {formatDuration(s!.durationMs)}
+                </span>
+              </div>
+              {syncPanelOpen && !s!.cancelled && (
+                <SyncPanel
+                  onlyACount={result.onlyA.length}
+                  onlyBCount={result.onlyB.length}
+                  syncing={syncing}
+                  syncProgress={syncProgress}
+                  syncResult={syncResult}
+                  undoable={undoable}
+                  undoing={undoing}
+                  undoProgress={undoProgress}
+                  undoResult={undoResult}
+                  onAction={handleSyncAction}
+                  onIgnore={handleIgnoreSync}
+                  onStop={handleStopSync}
+                  onUndo={handleUndo}
+                  onStopUndo={handleStopUndo}
+                />
+              )}
+              <ResultsView result={result} />
+            </section>
+          )}
+
+          {/* 空状态 */}
+          {!result && !running && (
+            <div className="flex h-52 flex-col items-center justify-center gap-2 rounded-xl border border-dashed text-muted-foreground">
+              <span className="text-4xl">🗂️</span>
+              <p className="text-sm">选择两个文件夹后点击「开始比对」</p>
+            </div>
+          )}
+        </>
       )}
     </div>
   );

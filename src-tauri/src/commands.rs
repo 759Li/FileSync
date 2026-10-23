@@ -34,6 +34,18 @@ pub fn start_compare(
         state.inner.running.store(false, Ordering::SeqCst);
         return Err("同步/撤销任务正在进行，请等待完成或停止后再比对".into());
     }
+    if state.inner.dup_scanning.load(Ordering::SeqCst) {
+        state.inner.running.store(false, Ordering::SeqCst);
+        return Err("重复文件扫描正在进行，请等待完成或停止后再比对".into());
+    }
+    if state.inner.dup_deleting.load(Ordering::SeqCst) {
+        state.inner.running.store(false, Ordering::SeqCst);
+        return Err("删除任务正在进行，请等待完成或停止后再比对".into());
+    }
+    if state.inner.trash_busy.load(Ordering::SeqCst) {
+        state.inner.running.store(false, Ordering::SeqCst);
+        return Err("回收站操作正在进行，请等待完成或停止后再比对".into());
+    }
     state.inner.cancel.store(false, Ordering::SeqCst);
     // 记录根目录，供比对后的同步操作还原相对路径；清空上一会话的撤销记录
     *state.inner.last_roots.lock().unwrap() = Some((dir_a.clone(), dir_b.clone()));
@@ -56,6 +68,195 @@ pub fn stop_compare(state: State<'_, CompareState>) -> bool {
     state.inner.running.load(Ordering::SeqCst)
 }
 
+/// 启动重复文件扫描（单个文件夹内查找互相重复的文件）。
+/// 后台线程执行：枚举 → 大小预筛 → 并行哈希 → 分组，进度/结果通过事件推送。
+#[tauri::command]
+pub fn start_dup_scan(
+    app: AppHandle,
+    state: State<'_, CompareState>,
+    path: String,
+) -> Result<(), String> {
+    let root = PathBuf::from(&path);
+    if !root.is_dir() {
+        return Err(format!("文件夹路径无效: {path}"));
+    }
+    if state.inner.running.load(Ordering::SeqCst) {
+        return Err("比对任务正在进行，请等待完成或停止后再扫描".into());
+    }
+    if state.inner.syncing.load(Ordering::SeqCst) || state.inner.undoing.load(Ordering::SeqCst) {
+        return Err("同步/撤销任务正在进行，请等待完成或停止后再扫描".into());
+    }
+    if state.inner.dup_deleting.load(Ordering::SeqCst) {
+        return Err("删除任务正在进行，请等待完成或停止后再扫描".into());
+    }
+    if state.inner.trash_busy.load(Ordering::SeqCst) {
+        return Err("回收站操作正在进行，请等待完成或停止后再扫描".into());
+    }
+    if state.inner.dup_scanning.swap(true, Ordering::SeqCst) {
+        return Err("已有重复文件扫描任务正在进行".into());
+    }
+    state.inner.cancel.store(false, Ordering::SeqCst);
+
+    let inner = state.inner.clone();
+    std::thread::spawn(move || {
+        let result = crate::dup_scan::run_dup_scan(&app, &inner, &root);
+        *inner.dup_result.lock().unwrap() = Some(result.clone());
+        inner.dup_scanning.store(false, Ordering::SeqCst);
+        let _ = app.emit("dup-scan-result", &result);
+    });
+    Ok(())
+}
+
+/// 终止正在运行的重复文件扫描（中断后仍输出已完成部分的结果）
+#[tauri::command]
+pub fn stop_dup_scan(state: State<'_, CompareState>) -> bool {
+    state.inner.cancel.store(true, Ordering::SeqCst);
+    state.inner.dup_scanning.load(Ordering::SeqCst)
+}
+
+/// 导出最近一次重复文件扫描结果为 CSV（后端缓存的完整结果，UTF-8 BOM，Excel 打开不乱码）
+#[tauri::command]
+pub fn export_dup_csv(state: State<'_, CompareState>, save_path: String) -> Result<String, String> {
+    let result = state.inner.dup_result.lock().unwrap().clone();
+    match result {
+        Some(r) => {
+            crate::csv_export::write_dup_csv(&r, Path::new(&save_path))?;
+            Ok(save_path)
+        }
+        None => Err("当前没有扫描结果，请先执行重复文件扫描".into()),
+    }
+}
+
+/// 一键删除选中的重复文件：移入 App 回收站（可一键撤销），后台线程执行，进度/结果通过事件推送
+///
+/// files: [{ path, size }]——size 为扫描时记录的大小，删除前逐项校验文件未被修改。
+#[tauri::command]
+pub fn delete_dup_files(
+    app: AppHandle,
+    state: State<'_, CompareState>,
+    files: Vec<crate::dup_trash::DupFileRef>,
+) -> Result<(), String> {
+    if files.is_empty() {
+        return Err("没有要删除的文件".into());
+    }
+    acquire_trash_op(&state.inner, TrashOp::Delete)?;
+    state.inner.cancel.store(false, Ordering::SeqCst);
+
+    let inner = state.inner.clone();
+    std::thread::spawn(move || {
+        let result = crate::dup_trash::run_delete_dup_files(&app, &inner, files);
+        inner.dup_deleting.store(false, Ordering::SeqCst);
+        let _ = app.emit("dup-delete-result", &result);
+    });
+    Ok(())
+}
+
+/// 撤销一次删除：把回收站批次中的文件恢复到原位置（后台线程执行，进度/结果通过事件推送）
+///
+/// batch_id: 删除结果中返回的批次号（也可从「回收站」列表中选择历史批次，重启后仍有效）
+#[tauri::command]
+pub fn undo_delete_dup(
+    app: AppHandle,
+    state: State<'_, CompareState>,
+    batch_id: String,
+) -> Result<(), String> {
+    acquire_trash_op(&state.inner, TrashOp::UndoPurge)?;
+    // 先确认批次存在，不存在则复位标志并报错（不起线程）
+    let batch = match crate::dup_trash::find_batch(&app, &batch_id) {
+        Some(b) => b,
+        None => {
+            state.inner.trash_busy.store(false, Ordering::SeqCst);
+            return Err("撤销批次不存在或已被恢复".into());
+        }
+    };
+    state.inner.cancel.store(false, Ordering::SeqCst);
+
+    let inner = state.inner.clone();
+    std::thread::spawn(move || {
+        let result = crate::dup_trash::run_undo_delete(&app, &inner, batch);
+        inner.trash_busy.store(false, Ordering::SeqCst);
+        let _ = app.emit("dup-undo-result", &result);
+    });
+    Ok(())
+}
+
+/// 彻底清空回收站：永久删除全部批次文件（不可恢复），后台线程执行
+#[tauri::command]
+pub fn purge_trash(app: AppHandle, state: State<'_, CompareState>) -> Result<(), String> {
+    acquire_trash_op(&state.inner, TrashOp::UndoPurge)?;
+    if crate::dup_trash::list_delete_batches(&app).is_empty() {
+        state.inner.trash_busy.store(false, Ordering::SeqCst);
+        return Err("回收站已是空的".into());
+    }
+    state.inner.cancel.store(false, Ordering::SeqCst);
+
+    let inner = state.inner.clone();
+    std::thread::spawn(move || {
+        let result = crate::dup_trash::run_purge_trash(&app, &inner);
+        inner.trash_busy.store(false, Ordering::SeqCst);
+        let _ = app.emit("dup-purge-result", &result);
+    });
+    Ok(())
+}
+
+/// 回收站中的删除批次列表（最新在前，供前端展示与选择撤销）
+#[tauri::command]
+pub fn list_delete_batches(app: AppHandle) -> Vec<crate::dup_trash::DeleteBatchSummary> {
+    crate::dup_trash::list_delete_batches(&app)
+}
+
+/// 在资源管理器中打开回收站文件夹
+#[tauri::command]
+pub fn open_trash_dir(app: AppHandle) -> Result<(), String> {
+    crate::dup_trash::open_trash_dir(&app)
+}
+
+/// 终止正在运行的回收站任务（删除 / 撤销 / 清空共用取消标志；已处理的生效，未处理的保留）
+#[tauri::command]
+pub fn stop_dup_delete(state: State<'_, CompareState>) -> bool {
+    state.inner.cancel.store(true, Ordering::SeqCst);
+    state.inner.dup_deleting.load(Ordering::SeqCst) || state.inner.trash_busy.load(Ordering::SeqCst)
+}
+
+/// 回收站任务类型：删除占用 dup_deleting，撤销 / 清空占用 trash_busy
+enum TrashOp {
+    Delete,
+    UndoPurge,
+}
+
+/// 回收站类任务（删除 / 撤销 / 清空）的互斥检查：与五类任务互斥，成功后占用自己的运行标志。
+/// 返回 Err 时尚未占用任何标志，调用方无需复位；任务结束时由调用方负责复位。
+fn acquire_trash_op(inner: &Inner, own: TrashOp) -> Result<(), String> {
+    if inner.running.load(Ordering::SeqCst) {
+        return Err("比对任务正在进行，请等待完成或停止后再操作".into());
+    }
+    if inner.dup_scanning.load(Ordering::SeqCst) {
+        return Err("重复文件扫描正在进行，请等待完成或停止后再操作".into());
+    }
+    if inner.syncing.load(Ordering::SeqCst) || inner.undoing.load(Ordering::SeqCst) {
+        return Err("同步/撤销任务正在进行，请等待完成或停止后再操作".into());
+    }
+    match own {
+        TrashOp::Delete => {
+            if inner.trash_busy.load(Ordering::SeqCst) {
+                return Err("回收站操作正在进行，请等待完成或停止后再删除".into());
+            }
+            if inner.dup_deleting.swap(true, Ordering::SeqCst) {
+                return Err("已有删除任务正在进行".into());
+            }
+        }
+        TrashOp::UndoPurge => {
+            if inner.dup_deleting.load(Ordering::SeqCst) {
+                return Err("删除任务正在进行，请等待完成或停止后再操作回收站".into());
+            }
+            if inner.trash_busy.swap(true, Ordering::SeqCst) {
+                return Err("已有回收站任务正在进行".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 执行同步动作（基于最近一次完整比对结果，后台线程复制文件）
 ///
 /// action: "unify" 一键一致化 | "aToB" A独有→B | "bToA" B独有→A
@@ -73,6 +274,15 @@ pub fn apply_sync_action(
     }
     if state.inner.undoing.load(Ordering::SeqCst) {
         return Err("撤销任务正在进行，请等待完成或停止后再同步".into());
+    }
+    if state.inner.dup_scanning.load(Ordering::SeqCst) {
+        return Err("重复文件扫描正在进行，请等待完成或停止后再同步".into());
+    }
+    if state.inner.dup_deleting.load(Ordering::SeqCst) {
+        return Err("删除任务正在进行，请等待完成或停止后再同步".into());
+    }
+    if state.inner.trash_busy.load(Ordering::SeqCst) {
+        return Err("回收站操作正在进行，请等待完成或停止后再同步".into());
     }
     if state.inner.syncing.swap(true, Ordering::SeqCst) {
         return Err("已有同步任务正在进行".into());
@@ -125,6 +335,15 @@ pub fn undo_sync(app: AppHandle, state: State<'_, CompareState>) -> Result<(), S
     }
     if state.inner.syncing.load(Ordering::SeqCst) {
         return Err("同步任务正在进行，请等待完成或停止后再撤销".into());
+    }
+    if state.inner.dup_scanning.load(Ordering::SeqCst) {
+        return Err("重复文件扫描正在进行，请等待完成或停止后再撤销".into());
+    }
+    if state.inner.dup_deleting.load(Ordering::SeqCst) {
+        return Err("删除任务正在进行，请等待完成或停止后再撤销".into());
+    }
+    if state.inner.trash_busy.load(Ordering::SeqCst) {
+        return Err("回收站操作正在进行，请等待完成或停止后再撤销".into());
     }
     if state.inner.undoing.swap(true, Ordering::SeqCst) {
         return Err("已有撤销任务正在进行".into());

@@ -185,14 +185,14 @@ pub fn hash_entries(
     }
 }
 
-enum HashOutcome {
+pub(crate) enum HashOutcome {
     Done(String),
     Cancelled,
     Failed(String),
 }
 
 /// 分块读取并计算单个文件的 SHA256（支持超大文件；每块检查取消标志）
-fn hash_file(path: &Path, cancel: &AtomicBool) -> HashOutcome {
+pub(crate) fn hash_file(path: &Path, cancel: &AtomicBool) -> HashOutcome {
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) => return HashOutcome::Failed(format!("打开失败: {e}")),
