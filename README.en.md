@@ -15,6 +15,7 @@ All hashing and file operations run locally — nothing is uploaded.
 ## Table of Contents
 
 - [Core Capabilities](#core-capabilities)
+- [Screenshots](#screenshots)
 - [Features](#features)
 - [Safety by Design](#safety-by-design)
 - [Requirements](#requirements)
@@ -37,6 +38,16 @@ All hashing and file operations run locally — nothing is uploaded.
 | **Duplicate scan & cleanup** | Recursively scan a single folder for duplicate files and move selected copies into an App-managed, undoable trash |
 
 Typical use cases: checking whether a backup is complete, verifying files after migration, aligning two copies of a dataset, and cleaning up disk space.
+
+## Screenshots
+
+### Folder Comparison
+
+![Folder comparison and sync](docs/screenshots/folder-compare.png)
+
+### Duplicate Scan
+
+![Duplicate scan and cleanup](docs/screenshots/duplicate-scan.png)
 
 ## Features
 
