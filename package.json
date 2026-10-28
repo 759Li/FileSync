@@ -2,6 +2,11 @@
   "name": "filesync",
   "private": true,
   "version": "0.3.0",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/759Li/FileSync.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
