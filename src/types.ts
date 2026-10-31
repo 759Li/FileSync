@@ -171,8 +171,8 @@ export interface DeleteBatchSummary {
   totalBytes: number;
 }
 
-/** 同步动作：unify 一键一致化 | aToB A独有→B | bToA B独有→A */
-export type SyncAction = "unify" | "aToB" | "bToA";
+/** 同步动作：unify 一键一致化 | aToB A独有→B | bToA B独有→A | selected 一致化勾选文件 */
+export type SyncAction = "unify" | "aToB" | "bToA" | "selected";
 
 /** 后端 sync-progress 事件的数据结构 */
 export interface SyncProgressPayload {

@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -41,6 +41,13 @@ export default function App(): ReactNode {
   const [undoResult, setUndoResult] = useState<UndoResult | null>(null);
   /** 当前累计可撤销的复制文件数（来自最近 sync-result / undo-result） */
   const [undoable, setUndoable] = useState(0);
+  /** 结果列表中勾选待一致化的文件路径（仅 A / 仅 B 各自独立） */
+  const [selectedA, setSelectedA] = useState<Set<string>>(new Set());
+  const [selectedB, setSelectedB] = useState<Set<string>>(new Set());
+  /** 同步 / 撤销成功后是否正在自动刷新结果列表 */
+  const [refreshing, setRefreshing] = useState(false);
+  /** 标记当前 compare-result 是否为自动刷新（区分手动比对，保留同步摘要与撤销记录） */
+  const autoRefreshRef = useRef(false);
   /** 重复文件扫描是否正在运行（仅用于任务期间禁用模式切换） */
   const [dupRunning, setDupRunning] = useState(false);
 
@@ -48,14 +55,35 @@ export default function App(): ReactNode {
   useEffect(() => {
     const u1 = listen<ProgressPayload>("compare-progress", (e) => setProgress(e.payload));
     const u2 = listen<CompareResult>("compare-result", (e) => {
-      setResult(e.payload);
+      const isAutoRefresh = autoRefreshRef.current;
+      autoRefreshRef.current = false;
       setRunning(false);
       setProgress(null);
+      if (isAutoRefresh) {
+        setRefreshing(false);
+        if (e.payload.stats.cancelled) {
+          // 刷新被中断：保留刷新前的结果与同步面板，撤销入口仍然可用
+          notify("结果列表刷新被中断，已保留刷新前的结果");
+          return;
+        }
+        // 自动刷新：保留同步 / 撤销摘要与撤销记录，只替换结果列表
+        setResult(e.payload);
+        setSelectedA(new Set());
+        setSelectedB(new Set());
+        setSyncPanelOpen(true);
+        notify("结果列表已按最新状态刷新");
+        return;
+      }
+      setResult(e.payload);
+      // 新结果对应新的文件清单，清空上一轮的勾选
+      setSelectedA(new Set());
+      setSelectedB(new Set());
       setSyncResult(null);
       setSyncProgress(null);
       setUndoResult(null);
       setUndoProgress(null);
       setUndoable(0);
+      setRefreshing(false);
       // 比对完整完成且存在单侧独有文件时，展示同步操作面板
       setSyncPanelOpen(!e.payload.stats.cancelled && e.payload.onlyA.length + e.payload.onlyB.length > 0);
     });
@@ -65,6 +93,11 @@ export default function App(): ReactNode {
       setSyncing(false);
       setSyncProgress(null);
       setUndoable(e.payload.undoable);
+      // 同步后结果列表仍是旧快照，清空勾选避免重复操作
+      setSelectedA(new Set());
+      setSelectedB(new Set());
+      // 有文件成功复制时，自动重新比对并刷新结果列表（保留撤销记录）
+      if (e.payload.copied > 0) startAutoRefresh();
     });
     const u5 = listen<UndoProgressPayload>("undo-progress", (e) => setUndoProgress(e.payload));
     const u6 = listen<UndoResult>("undo-result", (e) => {
@@ -72,6 +105,8 @@ export default function App(): ReactNode {
       setUndoing(false);
       setUndoProgress(null);
       setUndoable(e.payload.remaining);
+      // 有文件被撤销删除时，自动重新比对并刷新结果列表
+      if (e.payload.removed > 0) startAutoRefresh();
     });
     // 重复扫描事件：仅跟踪运行标志，用于任务期间禁用模式切换
     const u7 = listen("dup-scan-progress", () => setDupRunning(true));
@@ -93,6 +128,20 @@ export default function App(): ReactNode {
     setMessageType(type);
   };
 
+  /** 重新比对以刷新结果列表（同步 / 撤销成功后自动触发；后端保留撤销记录） */
+  const startAutoRefresh = () => {
+    autoRefreshRef.current = true;
+    setRunning(true);
+    setProgress(null);
+    setRefreshing(true);
+    invoke("refresh_compare").catch((e) => {
+      autoRefreshRef.current = false;
+      setRunning(false);
+      setRefreshing(false);
+      notify(`结果列表自动刷新失败：${e}`, "error");
+    });
+  };
+
   const handleStart = async () => {
     setMessage(null);
     setResult(null);
@@ -101,10 +150,14 @@ export default function App(): ReactNode {
     setSyncPanelOpen(false);
     setUndoResult(null);
     setUndoable(0);
+    setSelectedA(new Set());
+    setSelectedB(new Set());
+    // 先置为运行中，避免任务在 invoke 返回前完成时错过 / 覆盖状态
+    setRunning(true);
     try {
       await invoke("start_compare", { pathA, pathB });
-      setRunning(true);
     } catch (e) {
+      setRunning(false);
       notify(String(e), "error");
     }
   };
@@ -115,13 +168,59 @@ export default function App(): ReactNode {
 
   const handleSyncAction = async (action: SyncAction) => {
     setMessage(null);
+    setSyncing(true);
+    setSyncResult(null);
+    setSyncProgress(null);
+    setUndoResult(null);
     try {
       await invoke("apply_sync_action", { action });
-      setSyncing(true);
-      setSyncResult(null);
-      setSyncProgress(null);
-      setUndoResult(null);
     } catch (e) {
+      setSyncing(false);
+      notify(String(e), "error");
+    }
+  };
+
+  /** 勾选文件即表示要同步，确保操作面板可见（用户可能已点过「不做处理」） */
+  const ensureSyncPanelOpen = () => {
+    if (result && !result.stats.cancelled) setSyncPanelOpen(true);
+  };
+
+  /** 勾选 / 取消勾选结果列表中的单个独有文件 */
+  const toggleSelected = (side: "A" | "B", path: string) => {
+    const willSelect = !(side === "A" ? selectedA : selectedB).has(path);
+    const setter = side === "A" ? setSelectedA : setSelectedB;
+    setter((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+    if (willSelect) ensureSyncPanelOpen();
+  };
+
+  /** 全选 / 全不选某一侧的独有文件 */
+  const selectAllSelected = (side: "A" | "B", checked: boolean) => {
+    const files = side === "A" ? result?.onlyA ?? [] : result?.onlyB ?? [];
+    const setter = side === "A" ? setSelectedA : setSelectedB;
+    setter(checked ? new Set(files.map((f) => f.path)) : new Set());
+    if (checked && files.length > 0) ensureSyncPanelOpen();
+  };
+
+  /** 仅把勾选的文件复制到另一侧（A 勾选 → B，B 勾选 → A） */
+  const handleSyncSelected = async () => {
+    if (selectedA.size === 0 && selectedB.size === 0) return;
+    setMessage(null);
+    setSyncing(true);
+    setSyncResult(null);
+    setSyncProgress(null);
+    setUndoResult(null);
+    try {
+      await invoke("apply_sync_selected", {
+        selectedA: Array.from(selectedA),
+        selectedB: Array.from(selectedB),
+      });
+    } catch (e) {
+      setSyncing(false);
       notify(String(e), "error");
     }
   };
@@ -137,12 +236,13 @@ export default function App(): ReactNode {
 
   const handleUndo = async () => {
     setMessage(null);
+    setUndoing(true);
+    setUndoResult(null);
+    setUndoProgress(null);
     try {
       await invoke("undo_sync");
-      setUndoing(true);
-      setUndoResult(null);
-      setUndoProgress(null);
     } catch (e) {
+      setUndoing(false);
       notify(String(e), "error");
     }
   };
@@ -256,7 +356,15 @@ export default function App(): ReactNode {
             progress={progress}
             running={running}
             onStop={handleStop}
-            title={progress?.side === "B" ? "文件夹 B" : "文件夹 A"}
+            title={
+              refreshing
+                ? progress?.side === "B"
+                  ? "刷新列表 · 文件夹 B"
+                  : "刷新列表 · 文件夹 A"
+                : progress?.side === "B"
+                  ? "文件夹 B"
+                  : "文件夹 A"
+            }
           />
 
           {/* 取消提示 + 统计 + 同步操作 */}
@@ -275,7 +383,7 @@ export default function App(): ReactNode {
                 <Stat label="读取失败" value={s!.errorCount} />
                 {s!.cancelledCount > 0 && <Stat label="未处理(取消)" value={s!.cancelledCount} />}
                 <span className="ml-auto flex items-center gap-3">
-                  {!syncPanelOpen && hasUnique && !s!.cancelled && (
+                  {!syncPanelOpen && !s!.cancelled && (hasUnique || undoable > 0) && (
                     <Button variant="outline" size="sm" className="h-6 px-2 text-xs" onClick={() => setSyncPanelOpen(true)}>
                       同步操作
                     </Button>
@@ -287,7 +395,10 @@ export default function App(): ReactNode {
                 <SyncPanel
                   onlyACount={result.onlyA.length}
                   onlyBCount={result.onlyB.length}
+                  selectedACount={selectedA.size}
+                  selectedBCount={selectedB.size}
                   syncing={syncing}
+                  refreshing={refreshing}
                   syncProgress={syncProgress}
                   syncResult={syncResult}
                   undoable={undoable}
@@ -295,13 +406,20 @@ export default function App(): ReactNode {
                   undoProgress={undoProgress}
                   undoResult={undoResult}
                   onAction={handleSyncAction}
+                  onSyncSelected={handleSyncSelected}
                   onIgnore={handleIgnoreSync}
                   onStop={handleStopSync}
                   onUndo={handleUndo}
                   onStopUndo={handleStopUndo}
                 />
               )}
-              <ResultsView result={result} />
+              <ResultsView
+                result={result}
+                selectedA={selectedA}
+                selectedB={selectedB}
+                onToggleSelected={toggleSelected}
+                onSelectAll={selectAllSelected}
+              />
             </section>
           )}
 

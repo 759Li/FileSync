@@ -65,11 +65,13 @@ Typical use cases: checking whether a backup is complete, verifying files after 
 | Action | Behavior |
 |---|---|
 | Make Both Sides Identical | Copy A-only files to B and B-only files to A |
+| Unify Selected | Check individual files in the "Only in A" / "Only in B" lists and copy only the checked files to the other side (selections from both sides combine) |
 | A-only → B | Copy only A's unique files to B |
 | B-only → A | Copy only B's unique files to A |
 | Do Nothing | Just review results; reopen the panel from the stats bar later |
 
 - Sync preserves relative directory structure and creates missing target directories; progress is shown and can be stopped
+- **Automatic list refresh**: After a successful sync / undo, the comparison runs again automatically and updates the result list (the undo history is preserved so you can keep undoing)
 - **Never overwrites**: If the target already has a file with the same name but different content, it is skipped and counted as a conflict. Existing data is never overwritten; a summary shows copied / conflicted / failed counts and details
 - **Undoable sync**: Revert files copied during the current comparison session
   - Before deletion, each target file's size is checked against the size recorded at copy time; modified files are kept to prevent accidental deletion
@@ -82,7 +84,7 @@ Typical use cases: checking whether a backup is complete, verifying files after 
 - Recursively walks all subfolders; unreadable / failed entries are collected in an error list without aborting the scan
 - **Two-stage confirmation**: Files are first grouped by size; files with a unique size skip hashing entirely (prefilter). Only same-size files are hashed with SHA-256 and grouped by hash; a group with at least 2 files is a duplicate group — **duplicates are never inferred from file names**
 - Group list shows group number, per-file size, file count, reclaimable space, and full paths; double-click a row to reveal it in Explorer
-- **Cleanup helpers**: By default every copy except the first is selected (the first file, sorted by path, is the suggested keeper). Select all / none, "Keep only this file", or copy all selected paths (with total size) in one click
+- **Cleanup helpers**: By default every copy except the first is selected (the first file, sorted by path, is the suggested keeper). Use the global Select All / None above the list, per-group Select All / None, "Keep only this file", or copy all selected paths (with total size) in one click
 - Groups are sorted by reclaimable space so the biggest wins come first
 - **One-click delete (undoable)**: Selected copies are moved into the App-managed trash (`<App data dir>/filesync-trash/`, not the Windows Recycle Bin)
   - Triple validation before each deletion: the file must be inside the scan root, must still exist, and its size must match the size recorded during the scan
@@ -236,6 +238,7 @@ If GitHub is unreachable, prepend a working mirror prefix (for example `https://
    - **Errors**: entries that could not be read or traversed
 4. After a complete comparison, the "Follow-up Actions" panel appears:
    - **Make Both Sides Identical**: copy A-only files to B and B-only files to A (recommended for two-way backup alignment)
+   - **Unify Selected**: check files in the "Only in A" / "Only in B" lists (select all / none supported), then copy only the checked files; selections from both sides are applied in one click
    - **A-only → B** / **B-only → A**: copy unique files in one direction only
    - **Do Nothing**: close the panel; reopen it from "Sync Actions" in the stats bar
 5. Sync shows progress and can be stopped; review copied / conflicted / failed counts and details when done
@@ -243,7 +246,7 @@ If GitHub is unreachable, prepend a working mirror prefix (for example `https://
    - Files whose size no longer matches the copy-time record are kept automatically
    - Stop and resume the undo later if needed
 7. Click "Export Results CSV" to save the comparison; double-click any entry to reveal it in Explorer
-8. After sync or undo, the list still reflects the pre-sync snapshot; run the comparison again to verify the current state
+8. After a successful sync or undo, the app re-runs the comparison automatically and refreshes the result list (the undo history is preserved)
 
 ### Duplicate Scan & Cleanup
 
@@ -253,7 +256,7 @@ If GitHub is unreachable, prepend a working mirror prefix (for example `https://
 4. Results are grouped by duplicate set (largest reclaimable space first):
    - Group header: group number, per-file size × file count, reclaimable space, hash
    - Rows: full path and size; double-click to reveal the file
-   - Every copy except the first is selected by default; use "Keep" or "Select All / None" to adjust
+   - Every copy except the first is selected by default; use the global Select All / None above the list, or per-group "Keep" / Select All / None, to adjust
 5. "Copy Selected Paths" copies all selected paths with the total size, ready to paste into a cleanup script
 6. Click "🗑 Delete Selected Copies" and confirm:
    - Selected files move into the App trash after per-file validation
@@ -300,7 +303,7 @@ A: No. FileSync has no network functionality; all hashing and file operations ar
 
 **Q: Why didn't the result list change after a sync?**
 
-A: The list is a snapshot taken before the sync. Run the comparison again to verify the actual state.
+A: After a successful sync or undo, the app re-runs the comparison automatically and refreshes the list. If the automatic refresh was interrupted (for example by clicking "Stop"), click "Start Compare" to verify the current state manually.
 
 **Q: Both folders contain a file with the same name, but it is listed as "Only in A / Only in B". Why?**
 

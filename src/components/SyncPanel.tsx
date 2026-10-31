@@ -10,7 +10,12 @@ interface SyncPanelProps {
   onlyACount: number;
   /** B 独有文件数 */
   onlyBCount: number;
+  /** 已勾选待一致化的 A / B 独有文件数 */
+  selectedACount: number;
+  selectedBCount: number;
   syncing: boolean;
+  /** 同步 / 撤销成功后是否正在自动重新比对、刷新结果列表 */
+  refreshing: boolean;
   syncProgress: SyncProgressPayload | null;
   syncResult: SyncResult | null;
   /** 当前累计可撤销的复制文件数 */
@@ -19,6 +24,8 @@ interface SyncPanelProps {
   undoProgress: UndoProgressPayload | null;
   undoResult: UndoResult | null;
   onAction: (action: SyncAction) => void;
+  /** 一致化勾选的文件 */
+  onSyncSelected: () => void;
   onIgnore: () => void;
   onStop: () => void;
   onUndo: () => void;
@@ -29,7 +36,10 @@ interface SyncPanelProps {
 export function SyncPanel({
   onlyACount,
   onlyBCount,
+  selectedACount,
+  selectedBCount,
   syncing,
+  refreshing,
   syncProgress,
   syncResult,
   undoable,
@@ -37,6 +47,7 @@ export function SyncPanel({
   undoProgress,
   undoResult,
   onAction,
+  onSyncSelected,
   onIgnore,
   onStop,
   onUndo,
@@ -44,7 +55,8 @@ export function SyncPanel({
 }: SyncPanelProps) {
   const [showErrors, setShowErrors] = useState(false);
   const hasUnique = onlyACount + onlyBCount > 0;
-  const busy = syncing || undoing;
+  const selectedTotal = selectedACount + selectedBCount;
+  const busy = syncing || undoing || refreshing;
 
   return (
     <section className="space-y-3 rounded-xl border bg-card p-4 shadow-sm">
@@ -55,6 +67,12 @@ export function SyncPanel({
           <p className="text-xs text-muted-foreground">
             A 独有 <span className="font-medium text-foreground">{onlyACount.toLocaleString()}</span> 个 · B 独有{" "}
             <span className="font-medium text-foreground">{onlyBCount.toLocaleString()}</span> 个
+            {selectedTotal > 0 && (
+              <>
+                {" "}· 已勾选 A <span className="font-medium text-foreground">{selectedACount.toLocaleString()}</span> 个 · B{" "}
+                <span className="font-medium text-foreground">{selectedBCount.toLocaleString()}</span> 个
+              </>
+            )}
             {hasUnique && "（同名不同内容的文件会自动跳过，不会覆盖）"}
           </p>
         </div>
@@ -151,7 +169,11 @@ export function SyncPanel({
             </div>
           )}
           <p className="text-xs text-muted-foreground">
-            上方结果列表为同步前的快照，建议点击「开始比对」重新比对以验证一致性
+            {refreshing
+              ? "正在按最新状态重新比对并刷新结果列表…"
+              : syncResult.copied > 0
+                ? "结果列表已按最新状态自动刷新，可继续勾选剩余文件"
+                : "本次没有文件被复制，结果列表保持不变"}
           </p>
         </div>
       )}
@@ -190,6 +212,18 @@ export function SyncPanel({
       <div className="flex flex-wrap items-center gap-2">
         <Button size="sm" disabled={busy || !hasUnique} onClick={() => onAction("unify")} title="将 A 独有复制到 B，同时将 B 独有复制到 A">
           🔁 一键一致化（共 {(onlyACount + onlyBCount).toLocaleString()} 个）
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy || selectedTotal === 0}
+          onClick={onSyncSelected}
+          title="仅把「仅 A 独有 / 仅 B 独有」列表中勾选的文件复制到另一侧"
+          className={cn(
+            selectedTotal > 0 && !busy && "border-emerald-500/50 text-emerald-600 hover:text-emerald-600 dark:text-emerald-400"
+          )}
+        >
+          ✅ 一致化选中（{selectedTotal.toLocaleString()} 个）
         </Button>
         <Button size="sm" variant="outline" disabled={busy || onlyACount === 0} onClick={() => onAction("aToB")}>
           A 独有 → B（{onlyACount.toLocaleString()} 个）

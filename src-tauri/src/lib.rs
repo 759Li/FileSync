@@ -15,6 +15,7 @@ pub fn run() {
         .manage(state::CompareState::new())
         .invoke_handler(tauri::generate_handler![
             commands::start_compare,
+            commands::refresh_compare,
             commands::stop_compare,
             commands::start_dup_scan,
             commands::stop_dup_scan,
@@ -26,6 +27,7 @@ pub fn run() {
             commands::open_trash_dir,
             commands::export_dup_csv,
             commands::apply_sync_action,
+            commands::apply_sync_selected,
             commands::stop_sync,
             commands::undo_sync,
             commands::stop_undo,

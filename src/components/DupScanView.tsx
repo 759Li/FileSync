@@ -169,6 +169,23 @@ export function DupScanView(): ReactNode {
     setSelected((prev) => ({ ...prev, [groupId]: new Set(paths) }));
   };
 
+  /* 全部重复副本数（用于总体全选计数） */
+  const totalDupFiles = useMemo(
+    () => result?.groups.reduce((n, g) => n + g.files.length, 0) ?? 0,
+    [result]
+  );
+
+  /* 总体全选：选中每个组内的全部文件（与组内「全选」一致，含每组建议保留的首个副本） */
+  const selectAllGroups = () => {
+    if (!result) return;
+    const next: Record<number, Set<string>> = {};
+    for (const g of result.groups) next[g.id] = new Set(g.files.map((f) => f.path));
+    setSelected(next);
+  };
+
+  /* 总体全不选：清空所有组的勾选 */
+  const selectNoGroups = () => setSelected({});
+
   /* 复制全部选中（建议清理）的文件路径，便于粘贴进清理脚本或资源管理器 */
   const handleCopySelected = async () => {
     if (selCount === 0) {
@@ -453,6 +470,37 @@ export function DupScanView(): ReactNode {
               <span className={countClass(s!.errorCount)}>{s!.errorCount}条</span>
             </button>
           </div>
+
+          {/* 总体选择工具条 */}
+          {totalDupFiles > 0 && (
+            <div className="flex flex-wrap items-center gap-2 rounded-xl border bg-card px-3 py-1.5 text-xs text-muted-foreground shadow-sm">
+              <span>
+                已选 <span className="font-medium text-foreground">{selCount.toLocaleString()}</span> /{" "}
+                {totalDupFiles.toLocaleString()} 个
+              </span>
+              {selCount > 0 && <span>· {formatBytes(selBytes)}</span>}
+              <div className="ml-auto flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-xs"
+                  onClick={selectAllGroups}
+                  title="选中所有组内的全部文件（含每组建议保留的首个副本）"
+                >
+                  全选
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-xs"
+                  onClick={selectNoGroups}
+                  disabled={selCount === 0}
+                >
+                  全不选
+                </Button>
+              </div>
+            </div>
+          )}
 
           {/* 内容区 */}
           <div className="max-h-[calc(100vh-430px)] min-h-[200px] overflow-y-auto rounded-xl border bg-card shadow-sm">

@@ -1,6 +1,6 @@
 //! Tauri 命令：启动/停止比对、同步操作、导出 CSV、打开文件所在位置
 
-use crate::compare::{classify, CompareResult, ErrorItem};
+use crate::compare::{classify, CompareResult, ErrorItem, UniqueFile};
 use crate::scanner::{enumerate_folder, hash_entries, ProgressShared};
 use crate::state::{CompareState, Inner};
 use crate::sync::{run_sync, SyncAction};
@@ -27,31 +27,63 @@ pub fn start_compare(
     if !dir_b.is_dir() {
         return Err(format!("文件夹B路径无效: {path_b}"));
     }
-    if state.inner.running.swap(true, Ordering::SeqCst) {
+    // 用户手动开始新比对：清空上一会话的同步撤销记录
+    spawn_compare(app, state.inner.clone(), dir_a, dir_b, false)
+}
+
+/// 以上次比对的根目录重新比对（同步 / 撤销成功后自动刷新结果列表）。
+/// 保留同步撤销记录，刷新后仍可继续撤销之前复制 / 删除的文件。
+#[tauri::command]
+pub fn refresh_compare(app: AppHandle, state: State<'_, CompareState>) -> Result<(), String> {
+    let roots = state.inner.last_roots.lock().unwrap().clone();
+    let (dir_a, dir_b) =
+        roots.ok_or_else(|| "当前没有比对记录，请选择文件夹后先执行比对".to_string())?;
+    if !dir_a.is_dir() {
+        return Err(format!("文件夹A路径无效: {}", dir_a.display()));
+    }
+    if !dir_b.is_dir() {
+        return Err(format!("文件夹B路径无效: {}", dir_b.display()));
+    }
+    spawn_compare(app, state.inner.clone(), dir_a, dir_b, true)
+}
+
+/// 比对任务的公共启动逻辑：互斥检查 → 记录根目录 → 后台线程执行。
+///
+/// keep_undo 为 false 时清空上一会话的同步撤销记录（手动开始新比对）；
+/// 为 true 时保留（同步 / 撤销后的自动刷新，撤销操作仍可继续）。
+fn spawn_compare(
+    app: AppHandle,
+    inner: Arc<Inner>,
+    dir_a: PathBuf,
+    dir_b: PathBuf,
+    keep_undo: bool,
+) -> Result<(), String> {
+    if inner.running.swap(true, Ordering::SeqCst) {
         return Err("已有比对任务正在进行".into());
     }
-    if state.inner.syncing.load(Ordering::SeqCst) || state.inner.undoing.load(Ordering::SeqCst) {
-        state.inner.running.store(false, Ordering::SeqCst);
+    if inner.syncing.load(Ordering::SeqCst) || inner.undoing.load(Ordering::SeqCst) {
+        inner.running.store(false, Ordering::SeqCst);
         return Err("同步/撤销任务正在进行，请等待完成或停止后再比对".into());
     }
-    if state.inner.dup_scanning.load(Ordering::SeqCst) {
-        state.inner.running.store(false, Ordering::SeqCst);
+    if inner.dup_scanning.load(Ordering::SeqCst) {
+        inner.running.store(false, Ordering::SeqCst);
         return Err("重复文件扫描正在进行，请等待完成或停止后再比对".into());
     }
-    if state.inner.dup_deleting.load(Ordering::SeqCst) {
-        state.inner.running.store(false, Ordering::SeqCst);
+    if inner.dup_deleting.load(Ordering::SeqCst) {
+        inner.running.store(false, Ordering::SeqCst);
         return Err("删除任务正在进行，请等待完成或停止后再比对".into());
     }
-    if state.inner.trash_busy.load(Ordering::SeqCst) {
-        state.inner.running.store(false, Ordering::SeqCst);
+    if inner.trash_busy.load(Ordering::SeqCst) {
+        inner.running.store(false, Ordering::SeqCst);
         return Err("回收站操作正在进行，请等待完成或停止后再比对".into());
     }
-    state.inner.cancel.store(false, Ordering::SeqCst);
-    // 记录根目录，供比对后的同步操作还原相对路径；清空上一会话的撤销记录
-    *state.inner.last_roots.lock().unwrap() = Some((dir_a.clone(), dir_b.clone()));
-    state.inner.last_sync.lock().unwrap().clear();
+    inner.cancel.store(false, Ordering::SeqCst);
+    // 记录根目录，供比对后的同步操作还原相对路径
+    *inner.last_roots.lock().unwrap() = Some((dir_a.clone(), dir_b.clone()));
+    if !keep_undo {
+        inner.last_sync.lock().unwrap().clear();
+    }
 
-    let inner = state.inner.clone();
     std::thread::spawn(move || {
         let result = run_compare(&app, &inner, &dir_a, &dir_b);
         *inner.last_result.lock().unwrap() = Some(result.clone());
@@ -268,25 +300,7 @@ pub fn apply_sync_action(
 ) -> Result<(), String> {
     let action = SyncAction::parse(&action)
         .ok_or_else(|| format!("未知的同步动作: {action}（可选 unify / aToB / bToA）"))?;
-
-    if state.inner.running.load(Ordering::SeqCst) {
-        return Err("比对任务正在进行，请等待完成或停止后再同步".into());
-    }
-    if state.inner.undoing.load(Ordering::SeqCst) {
-        return Err("撤销任务正在进行，请等待完成或停止后再同步".into());
-    }
-    if state.inner.dup_scanning.load(Ordering::SeqCst) {
-        return Err("重复文件扫描正在进行，请等待完成或停止后再同步".into());
-    }
-    if state.inner.dup_deleting.load(Ordering::SeqCst) {
-        return Err("删除任务正在进行，请等待完成或停止后再同步".into());
-    }
-    if state.inner.trash_busy.load(Ordering::SeqCst) {
-        return Err("回收站操作正在进行，请等待完成或停止后再同步".into());
-    }
-    if state.inner.syncing.swap(true, Ordering::SeqCst) {
-        return Err("已有同步任务正在进行".into());
-    }
+    acquire_sync_op(&state.inner)?;
 
     let result = state.inner.last_result.lock().unwrap().clone();
     let roots = state.inner.last_roots.lock().unwrap().clone();
@@ -314,6 +328,96 @@ pub fn apply_sync_action(
         inner.syncing.store(false, Ordering::SeqCst);
         let _ = app.emit("sync-result", &sync_result);
     });
+    Ok(())
+}
+
+/// 一致化勾选的文件：A 侧勾选 → B，B 侧勾选 → A（后台线程复制）
+///
+/// selected_a / selected_b 为前端勾选的绝对路径。后端以最近一次完整比对结果为唯一来源，
+/// 只同步确实属于「仅 A 独有 / 仅 B 独有」的路径（忽略陈旧或非法选择），文件大小也取自后端结果。
+#[tauri::command]
+pub fn apply_sync_selected(
+    app: AppHandle,
+    state: State<'_, CompareState>,
+    selected_a: Vec<String>,
+    selected_b: Vec<String>,
+) -> Result<(), String> {
+    if selected_a.is_empty() && selected_b.is_empty() {
+        return Err("没有勾选要一致化的文件".into());
+    }
+    acquire_sync_op(&state.inner)?;
+
+    let result = state.inner.last_result.lock().unwrap().clone();
+    let roots = state.inner.last_roots.lock().unwrap().clone();
+
+    let (result, (dir_a, dir_b)) = match (result, roots) {
+        (Some(r), Some(p)) => (r, p),
+        _ => {
+            state.inner.syncing.store(false, Ordering::SeqCst);
+            return Err("当前没有比对结果，请先执行比对".into());
+        }
+    };
+    if result.stats.cancelled {
+        state.inner.syncing.store(false, Ordering::SeqCst);
+        return Err("上次比对被中断、结果不完整，请重新完成比对后再同步".into());
+    }
+    if !dir_a.is_dir() || !dir_b.is_dir() {
+        state.inner.syncing.store(false, Ordering::SeqCst);
+        return Err("比对时的某个文件夹已不存在，无法执行同步".into());
+    }
+
+    // 用最近一次比对结果校验并取文件大小，避免前端传入陈旧或非法路径
+    let want_a: HashSet<&str> = selected_a.iter().map(String::as_str).collect();
+    let want_b: HashSet<&str> = selected_b.iter().map(String::as_str).collect();
+    let files_a: Vec<UniqueFile> = result
+        .only_a
+        .iter()
+        .filter(|f| want_a.contains(f.path.as_str()))
+        .cloned()
+        .collect();
+    let files_b: Vec<UniqueFile> = result
+        .only_b
+        .iter()
+        .filter(|f| want_b.contains(f.path.as_str()))
+        .cloned()
+        .collect();
+    if files_a.is_empty() && files_b.is_empty() {
+        state.inner.syncing.store(false, Ordering::SeqCst);
+        return Err("勾选的文件已不在最近一次比对结果中，请重新比对".into());
+    }
+
+    state.inner.cancel.store(false, Ordering::SeqCst);
+    let inner = state.inner.clone();
+    std::thread::spawn(move || {
+        let sync_result =
+            crate::sync::run_sync_selected(&app, &inner, &files_a, &files_b, &dir_a, &dir_b);
+        inner.syncing.store(false, Ordering::SeqCst);
+        let _ = app.emit("sync-result", &sync_result);
+    });
+    Ok(())
+}
+
+/// 同步类任务互斥检查：与比对 / 撤销 / 重复扫描 / 删除 / 回收站操作互斥，
+/// 检查通过后占用 syncing 标志（调用方负责在任务结束时复位）。
+fn acquire_sync_op(inner: &Inner) -> Result<(), String> {
+    if inner.running.load(Ordering::SeqCst) {
+        return Err("比对任务正在进行，请等待完成或停止后再同步".into());
+    }
+    if inner.undoing.load(Ordering::SeqCst) {
+        return Err("撤销任务正在进行，请等待完成或停止后再同步".into());
+    }
+    if inner.dup_scanning.load(Ordering::SeqCst) {
+        return Err("重复文件扫描正在进行，请等待完成或停止后再同步".into());
+    }
+    if inner.dup_deleting.load(Ordering::SeqCst) {
+        return Err("删除任务正在进行，请等待完成或停止后再同步".into());
+    }
+    if inner.trash_busy.load(Ordering::SeqCst) {
+        return Err("回收站操作正在进行，请等待完成或停止后再同步".into());
+    }
+    if inner.syncing.swap(true, Ordering::SeqCst) {
+        return Err("已有同步任务正在进行".into());
+    }
     Ok(())
 }
 

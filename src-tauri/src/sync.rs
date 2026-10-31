@@ -171,13 +171,6 @@ pub fn run_sync(
     root_a: &Path,
     root_b: &Path,
 ) -> SyncResult {
-    let start = Instant::now();
-    let mut outcome = SyncResult {
-        action: action.as_str().to_string(),
-        action_label: action.label().to_string(),
-        ..Default::default()
-    };
-
     // 1. 按动作构建复制计划（保持 A→B 在前的顺序）
     let mut plan: Vec<CopyItem> = Vec::new();
     if matches!(action, SyncAction::Unify | SyncAction::AToB) {
@@ -186,6 +179,38 @@ pub fn run_sync(
     if matches!(action, SyncAction::Unify | SyncAction::BToA) {
         plan.extend(build_items(&result.only_b, root_b, root_a));
     }
+
+    execute_plan(app, inner, action.as_str(), action.label(), plan)
+}
+
+/// 一致化勾选的文件：A 侧选中的 → B，B 侧选中的 → A
+pub fn run_sync_selected(
+    app: &AppHandle,
+    inner: &Arc<Inner>,
+    selected_a: &[UniqueFile],
+    selected_b: &[UniqueFile],
+    root_a: &Path,
+    root_b: &Path,
+) -> SyncResult {
+    let mut plan = build_items(selected_a, root_a, root_b);
+    plan.extend(build_items(selected_b, root_b, root_a));
+    execute_plan(app, inner, "selected", "一致化选中", plan)
+}
+
+/// 执行复制计划：串行复制（避免磁盘争抢），进度事件节流推送，成功后累积撤销记录
+fn execute_plan(
+    app: &AppHandle,
+    inner: &Arc<Inner>,
+    action: &str,
+    action_label: &str,
+    plan: Vec<CopyItem>,
+) -> SyncResult {
+    let start = Instant::now();
+    let mut outcome = SyncResult {
+        action: action.to_string(),
+        action_label: action_label.to_string(),
+        ..Default::default()
+    };
 
     let total = plan.len();
     let mut last_emit = Instant::now() - EMIT_INTERVAL; // 保证首个事件立即发出
